@@ -147,3 +147,5 @@ mongo-data/
 
 # Docker
 .dockerignore
+
+.cursorrules

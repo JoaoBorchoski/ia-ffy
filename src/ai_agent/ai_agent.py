@@ -2,9 +2,14 @@ import os
 from dotenv import load_dotenv
 import json
 import logging
-from typing import Dict, List, Any
-from openai import AsyncOpenAI
-from src.db.database import db_manager
+from typing import Dict, List, Any, Optional
+from langchain_openai import ChatOpenAI
+from langchain.agents import create_openai_tools_agent, AgentExecutor
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+from langchain.memory import ConversationBufferWindowMemory
+from src.ai_agent.tools import TOOLS
+from src.ai_agent.memory_manager import RedisMemoryManager
 
 load_dotenv()
 
@@ -13,215 +18,295 @@ logger = logging.getLogger(__name__)
 
 class CargaAIAgent:
     def __init__(self):
-        self.client = AsyncOpenAI(
+        self.llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.1,
             api_key=os.getenv("OPENAI_API_KEY")
         )
 
-    async def analyze_question(self, question: str) -> Dict[str, Any]:
-        system_prompt = """
-        Você é um assistente especializado em análise de cargas e logística.
-        Sua função é analisar perguntas sobre cargas e determinar que tipo de busca deve ser feita no banco de dados.
+        self.memory_manager = RedisMemoryManager(memory_window=10)
 
-        Tipos de busca disponíveis:
-        1. "search_by_identifier" - quando o usuário menciona um código, número, chave ou pedido específico
-        2. "search_by_status" - quando o usuário pergunta sobre status das cargas
-        3. "list_all" - quando o usuário quer ver todas as cargas
-        4. "general_info" - para perguntas gerais sobre uma carga específica
+        self.user_memories: Dict[str, ConversationBufferWindowMemory] = {}
 
-        IMPORTANTE: Para extrair identificadores, procure por:
-        - Códigos de carga (ex: D-ABCD, C-123)
-        - Números de documento (ex: 00123456, 123456789)
-        - Chaves de documento (ex: chaves de NFe, CT-e)
-        - Pedidos do embarcador (ex: PED-123, ORD-456)
-        
-        Extraia APENAS o identificador específico, não a pergunta inteira.
+        self.memory_window = 10
 
-        Responda SEMPRE em formato JSON com:
-        {
-            "search_type": "tipo_de_busca",
-            "identifier": "identificador_extraído_se_houver",
-            "status": "status_se_mencionado",
-            "intent": "intenção_da_pergunta"
-        }
+        self.prompt = ChatPromptTemplate.from_messages([
+            ("system", """
+Você é um assistente especializado em análise de cargas e logística.
+Sua função é ajudar usuários a encontrar informações sobre cargas usando as ferramentas disponíveis.
 
-        Exemplos:
-        - "qual o status da carga D-ABCD" -> {"search_type": "search_by_identifier", "identifier": "D-ABCD", "status": null, "intent": "verificar_status"}
-        - "qual o status da carga 00123456" -> {"search_type": "search_by_identifier", "identifier": "00123456", "status": null, "intent": "verificar_status"}
-        - "mostre cargas disponíveis" -> {"search_type": "search_by_status", "identifier": null, "status": "disponivel", "intent": "listar_por_status"}
-        - "liste todas as cargas" -> {"search_type": "list_all", "identifier": null, "status": null, "intent": "listar_todas"}
-        """
+FERRAMENTAS DISPONÍVEIS:
+- search_carga_by_identifier: Busca carga por código, número de documento, chave ou pedido
+- search_cargas_by_status: Busca cargas por status específico
+- list_all_cargas: Lista todas as cargas do proprietário
+- get_carga_details: Obtém detalhes completos de uma carga específica
 
-        try:
-            response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": question}
-                ],
-                temperature=0.1,
-                max_tokens=200
+INSTRUÇÕES:
+1. Analise a pergunta do usuário cuidadosamente
+2. Identifique qual ferramenta usar baseado na pergunta
+3. Extraia os parâmetros necessários (identificador, status, owner_id)
+4. Use a ferramenta apropriada
+5. Se necessário, use múltiplas ferramentas para obter informações completas
+6. Forneça uma resposta clara e organizada
+
+EXEMPLOS DE USO:
+- "Qual o status da carga D-ABCD?" → use search_carga_by_identifier
+- "Mostre cargas disponíveis" → use search_cargas_by_status com status="disponivel"
+- "Liste todas as cargas" → use list_all_cargas
+- "Detalhes da carga D-ABCD" → use get_carga_details
+
+Seja sempre útil e forneça informações completas e organizadas.
+            """),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "{input}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad"),
+        ])
+
+        self.agent = create_openai_tools_agent(
+            llm=self.llm,
+            tools=TOOLS,
+            prompt=self.prompt
+        )
+
+        self.agent_executor = AgentExecutor(
+            agent=self.agent,
+            tools=TOOLS,
+            verbose=True,
+            handle_parsing_errors=True,
+            max_iterations=5
+        )
+
+    def _get_user_memory(self, owner_id: str, user_id: str) -> ConversationBufferWindowMemory:
+        memory_key = f"{owner_id}:{user_id}"
+
+        if self.memory_manager.is_connected():
+            return self.memory_manager.get_user_memory(memory_key)
+
+        if memory_key not in self.user_memories:
+            self.user_memories[memory_key] = ConversationBufferWindowMemory(
+                k=self.memory_window,
+                return_messages=True,
+                memory_key="chat_history"
             )
+            logger.info(
+                f"Criada nova memória de contexto em RAM para owner_id: {owner_id}, user_id: {user_id}")
 
-            analysis = json.loads(response.choices[0].message.content)
-            return analysis
+        return self.user_memories[memory_key]
 
-        except Exception as e:
-            logger.error(f"Erro ao analisar pergunta: {e}")
-            return {
-                "search_type": "search_by_identifier",
-                "identifier": question,
-                "status": None,
-                "intent": "busca_geral"
-            }
+    def _create_agent_with_memory(self, owner_id: str, user_id: str, user_memory: ConversationBufferWindowMemory) -> AgentExecutor:
+        logger.info(
+            f"Memória criada para owner_id: {owner_id}, user_id: {user_id}, mensagens: {len(user_memory.chat_memory.messages)}")
 
-    async def format_response(self, question: str, data: List[Dict[str, Any]], analysis: Dict[str, Any]) -> str:
-        if not data:
-            return "Não foram encontradas cargas que correspondam à sua consulta."
+        agent_with_memory = create_openai_tools_agent(
+            llm=self.llm,
+            tools=TOOLS,
+            prompt=self.prompt
+        )
 
-        data_summary = []
-        for item in data:
-            summary = {
-                "codigo": item.get("codigo"),
-                "status": item.get("status"),
-                "pedido_embarcador": item.get("pedido_embarcador"),
-                "remetente": f"{item.get('nome_empresa_remetente')} - {item.get('cidade_remetente')}/{item.get('estado_remetente')}",
-                "destinatario": f"{item.get('nome_empresa_destinatario')} - {item.get('cidade_destinatario')}/{item.get('estado_destinatario')}",
-                "documento": {
-                    "numero": item.get("numero_documento"),
-                    "chave": item.get("chave_documento"),
-                    "tipo": item.get("tipo_documento"),
-                    "data_emissao": str(item.get("data_emissao")) if item.get("data_emissao") else None
-                }
-            }
-            data_summary.append(summary)
+        agent_executor = AgentExecutor(
+            agent=agent_with_memory,
+            tools=TOOLS,
+            memory=user_memory,
+            verbose=True,
+            handle_parsing_errors=True,
+            max_iterations=5
+        )
 
-        system_prompt = f"""
-        Você é um assistente especializado em logística e cargas.
-        Formate uma resposta clara e organizada baseada nos dados encontrados.
-        
-        Pergunta original: "{question}"
-        Intenção detectada: {analysis.get('intent', 'busca_geral')}
-        
-        Diretrizes:
-        - Seja claro e objetivo
-        - Organize as informações de forma lógica
-        - Inclua todos os dados relevantes
-        - Use formatação para melhor legibilidade
-        - Se houver múltiplas cargas, organize por relevância
-        - Destaque informações importantes como status
-        
-        Dados encontrados: {json.dumps(data_summary, ensure_ascii=False, indent=2)}
-        """
+        return agent_executor
 
+    async def process_question(self, question: str, owner_id: str, user_id: str) -> Dict[str, Any]:
         try:
-            response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": "Formate uma resposta baseada nos dados fornecidos."}
-                ],
-                temperature=0.3,
-                max_tokens=1000
-            )
+            logger.info(
+                f"Processando pergunta: '{question}' para owner_id: {owner_id}, user_id: {user_id}")
 
-            return response.choices[0].message.content
+            user_memory = self._get_user_memory(owner_id, user_id)
 
-        except Exception as e:
-            logger.error(f"Erro ao formatar resposta: {e}")
-            return self._format_simple_response(data)
+            user_memory.chat_memory.add_user_message(question)
 
-    def _format_simple_response(self, data: List[Dict[str, Any]]) -> str:
-        if len(data) == 1:
-            item = data[0]
-            return f"""
-Carga encontrada:
-• Código: {item.get('codigo', 'N/A')}
-• Status: {item.get('status', 'N/A')}
-• Pedido Embarcador: {item.get('pedido_embarcador', 'N/A')}
-• Remetente: {item.get('nome_empresa_remetente', 'N/A')} - {item.get('cidade_remetente', 'N/A')}/{item.get('estado_remetente', 'N/A')}
-• Destinatário: {item.get('nome_empresa_destinatario', 'N/A')} - {item.get('cidade_destinatario', 'N/A')}/{item.get('estado_destinatario', 'N/A')}
-• Documento: {item.get('numero_documento', 'N/A')} (Tipo: {item.get('tipo_documento', 'N/A')})
-• Chave: {item.get('chave_documento', 'N/A')}
-            """.strip()
-        else:
-            response = f"Encontradas {len(data)} cargas:\n\n"
-            for i, item in enumerate(data[:5], 1):
-                response += f"{i}. Código: {item.get('codigo', 'N/A')} | Status: {item.get('status', 'N/A')} | Remetente: {item.get('nome_empresa_remetente', 'N/A')}\n"
+            contextual_question = f"Pergunta: {question}\n\nContexto: O owner_id é '{owner_id}'. Use este owner_id em todas as buscas no banco de dados."
 
-            if len(data) > 5:
-                response += f"\n... e mais {len(data) - 5} cargas."
+            agent_with_memory = self._create_agent_with_memory(
+                owner_id, user_id, user_memory)
 
-            return response
+            result = await agent_with_memory.ainvoke({
+                "input": contextual_question
+            })
 
-    async def process_question(self, question: str, owner_id: str) -> Dict[str, Any]:
-        try:
-            analysis = await self.analyze_question(question)
-            logger.info(f"Análise da pergunta: {analysis}")
+            agent_response = result.get(
+                "output", "Não foi possível processar a pergunta.")
 
-            data = []
-            search_type = analysis.get("search_type", "search_by_identifier")
+            user_memory.chat_memory.add_ai_message(agent_response)
 
-            if search_type == "search_by_identifier" and analysis.get("identifier"):
-                data = await db_manager.search_carga_by_identifier(
-                    analysis["identifier"], owner_id
-                )
-            elif search_type == "search_by_status" and analysis.get("status"):
-                data = await db_manager.search_cargas_by_status(
-                    analysis["status"], owner_id
-                )
-            elif search_type == "list_all":
-                data = await db_manager.get_all_cargas_by_owner(owner_id)
+            if self.memory_manager.is_connected():
+                memory_key = f"{owner_id}:{user_id}"
+                success = self.memory_manager.save_user_memory(
+                    memory_key, user_memory)
+                if success:
+                    logger.info(
+                        f"Memória salva no Redis para owner_id: {owner_id}, user_id: {user_id} ({len(user_memory.chat_memory.messages)} mensagens)")
+                else:
+                    logger.warning(
+                        f"Falha ao salvar memória no Redis para owner_id: {owner_id}, user_id: {user_id}")
             else:
-                # Fallback: tentar extrair identificadores da pergunta
-                import re
+                logger.warning(
+                    "Redis não conectado, memória não será persistida")
 
-                # Procurar por padrões de identificadores comuns
-                patterns = [
-                    r'\b[A-Z]-\d+\b',  # D-123, C-456
-                    r'\b\d{6,}\b',     # 00123456, 123456789
-                    r'\b[A-Z]{2,}\d+\b',  # PED123, ORD456
-                    r'\b\d+[A-Z]+\b',  # 123ABC
-                ]
+            raw_data = []
+            data_count = 0
 
-                for pattern in patterns:
-                    matches = re.findall(pattern, question.upper())
-                    for match in matches:
-                        temp_data = await db_manager.search_carga_by_identifier(match, owner_id)
-                        if temp_data:
-                            data.extend(temp_data)
-                            break
-                    if data:
-                        break
-
-                # Se ainda não encontrou nada, tentar palavras individuais
-                if not data:
-                    words = question.split()
-                    for word in words:
-                        if len(word) > 2 and word.isalnum():
-                            temp_data = await db_manager.search_carga_by_identifier(word, owner_id)
-                            if temp_data:
-                                data.extend(temp_data)
-                                break
-
-            formatted_response = await self.format_response(question, data, analysis)
+            if "código:" in agent_response.lower() or "carga encontrada" in agent_response.lower():
+                data_count = 1
 
             return {
                 "success": True,
-                "response": formatted_response,
-                "data_count": len(data),
-                "analysis": analysis,
-                "raw_data": data
+                "response": agent_response,
+                "data_count": data_count,
+                "analysis": {
+                    "agent_used": True,
+                    "tools_available": [tool.name for tool in TOOLS],
+                    "reasoning": "Agente LangChain processou a pergunta usando ferramentas disponíveis"
+                },
+                "raw_data": raw_data
             }
 
         except Exception as e:
-            logger.error(f"Erro ao processar pergunta: {e}")
+            logger.error(f"Erro ao processar pergunta com agente: {e}")
             return {
                 "success": False,
                 "response": f"Desculpe, ocorreu um erro ao processar sua pergunta: {str(e)}",
                 "data_count": 0,
-                "analysis": None,
+                "analysis": {
+                    "agent_used": True,
+                    "error": str(e)
+                },
                 "raw_data": []
             }
+
+    def clear_user_memory(self, owner_id: str, user_id: str = None) -> bool:
+        try:
+            if user_id:
+                memory_key = f"{owner_id}:{user_id}"
+
+                if self.memory_manager.is_connected():
+                    success = self.memory_manager.clear_user_memory(memory_key)
+                    if success:
+                        logger.info(
+                            f"Memória limpa no Redis para owner_id: {owner_id}, user_id: {user_id}")
+                        return True
+
+                if memory_key in self.user_memories:
+                    del self.user_memories[memory_key]
+                    logger.info(
+                        f"Memória limpa em RAM para owner_id: {owner_id}, user_id: {user_id}")
+                    return True
+            else:
+                cleared_count = 0
+
+                if self.memory_manager.is_connected():
+                    pattern = f"agent_memory:{owner_id}:*"
+                    keys = self.memory_manager.redis_client.keys(pattern)
+                    for key in keys:
+                        if self.memory_manager.redis_client.delete(key):
+                            cleared_count += 1
+                    logger.info(
+                        f"Memórias limpas no Redis para owner_id: {owner_id} ({cleared_count} usuários)")
+
+                memory_keys_to_remove = [
+                    key for key in self.user_memories.keys() if key.startswith(f"{owner_id}:")]
+                for key in memory_keys_to_remove:
+                    del self.user_memories[key]
+                    cleared_count += 1
+                logger.info(
+                    f"Memórias limpas em RAM para owner_id: {owner_id} ({len(memory_keys_to_remove)} usuários)")
+
+                return cleared_count > 0
+
+            return False
+        except Exception as e:
+            logger.error(f"Erro ao limpar memória: {e}")
+            return False
+
+    def get_user_memory_info(self, owner_id: str, user_id: str = None) -> Dict[str, Any]:
+        if user_id:
+            memory_key = f"{owner_id}:{user_id}"
+
+            if self.memory_manager.is_connected():
+                return self.memory_manager.get_user_memory_info(memory_key)
+
+            if memory_key not in self.user_memories:
+                return {
+                    "has_memory": False,
+                    "message_count": 0,
+                    "memory_window": self.memory_window,
+                    "storage": "ram",
+                    "owner_id": owner_id,
+                    "user_id": user_id
+                }
+
+            memory = self.user_memories[memory_key]
+            return {
+                "has_memory": True,
+                "message_count": len(memory.chat_memory.messages),
+                "memory_window": self.memory_window,
+                "storage": "ram",
+                "owner_id": owner_id,
+                "user_id": user_id,
+                "recent_messages": [
+                    {
+                        "type": msg.__class__.__name__,
+                        "content": msg.content[:100] + "..." if len(msg.content) > 100 else msg.content
+                    }
+                    for msg in memory.chat_memory.messages[-5:]
+                ]
+            }
+        else:
+            users_info = []
+
+            if self.memory_manager.is_connected():
+                pattern = f"agent_memory:{owner_id}:*"
+                keys = self.memory_manager.redis_client.keys(pattern)
+                for key in keys:
+                    user_id_from_key = key.replace(
+                        f"agent_memory:{owner_id}:", "")
+                    user_info = self.memory_manager.get_user_memory_info(key)
+                    user_info["owner_id"] = owner_id
+                    user_info["user_id"] = user_id_from_key
+                    users_info.append(user_info)
+            else:
+                for memory_key in self.user_memories.keys():
+                    if memory_key.startswith(f"{owner_id}:"):
+                        user_id_from_key = memory_key.replace(
+                            f"{owner_id}:", "")
+                        memory = self.user_memories[memory_key]
+                        user_info = {
+                            "has_memory": True,
+                            "message_count": len(memory.chat_memory.messages),
+                            "memory_window": self.memory_window,
+                            "storage": "ram",
+                            "owner_id": owner_id,
+                            "user_id": user_id_from_key
+                        }
+                        users_info.append(user_info)
+
+            return {
+                "owner_id": owner_id,
+                "total_users": len(users_info),
+                "users": users_info
+            }
+
+    def get_all_memories_info(self) -> Dict[str, Any]:
+        if self.memory_manager.is_connected():
+            return self.memory_manager.get_all_memories_info()
+
+        return {
+            "total_users": len(self.user_memories),
+            "users": list(self.user_memories.keys()),
+            "memory_window": self.memory_window,
+            "storage": "ram"
+        }
+
+    def get_redis_info(self) -> Dict[str, Any]:
+        return self.memory_manager.get_redis_info()
 
 
 ai_agent = CargaAIAgent()

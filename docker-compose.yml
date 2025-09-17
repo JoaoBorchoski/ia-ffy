@@ -1,62 +1,3 @@
-# version: '3.8'
-
-# services:
-#   # API Principal
-#   api:
-#     build: .
-#     ports:
-#       - "8000:8000"
-#     environment:
-#       - OPENAI_API_KEY=${OPENAI_API_KEY}
-#       - MONGODB_URI=mongodb://mongo:27017/
-#       - MONGODB_DATABASE=ffy_assistant
-#       - APP_NAME=FFY Data Assistant
-#       - APP_VERSION=1.0.0
-#     depends_on:
-#       - mongo
-#     volumes:
-#       - ./logs:/app/logs
-#     restart: unless-stopped
-#     networks:
-#       - ffy-network
-
-#   # MongoDB
-#   mongo:
-#     image: mongo:6.0
-#     ports:
-#       - "27017:27017"
-#     environment:
-#       - MONGO_INITDB_DATABASE=ffy_assistant
-#     volumes:
-#       - mongo_data:/data/db
-#       - ./mongo-init:/docker-entrypoint-initdb.d
-#     restart: unless-stopped
-#     networks:
-#       - ffy-network
-
-#   # MongoDB Express (Interface web opcional)
-#   mongo-express:
-#     image: mongo-express:latest
-#     ports:
-#       - "8081:8081"
-#     environment:
-#       - ME_CONFIG_MONGODB_SERVER=mongo
-#       - ME_CONFIG_MONGODB_PORT=27017
-#       - ME_CONFIG_BASICAUTH_USERNAME=admin
-#       - ME_CONFIG_BASICAUTH_PASSWORD=admin123
-#     depends_on:
-#       - mongo
-#     restart: unless-stopped
-#     networks:
-#       - ffy-network
-
-# volumes:
-#   mongo_data:
-
-# networks:
-#   ffy-network:
-#     driver: bridge
-
 version: "3.8"
 
 services:
@@ -69,12 +10,46 @@ services:
             POSTGRES_PASSWORD: 123456
             POSTGRES_DB: ffy_db
         volumes:
-            - pgdata:/data/postgres
+            - pgdata:/var/lib/postgresql/data
         ports:
             - "5432:5432"
+        networks:
+            - ffy-network
+
+    # Redis para memória persistente
+    redis:
+        image: redis:7-alpine
+        container_name: ffy_redis
+        restart: always
+        command: redis-server --appendonly yes
+        volumes:
+            - redis_data:/data
+        ports:
+            - "6379:6379"
+        networks:
+            - ffy-network
+
+    # API Principal
+    # api:
+    #     build: .
+    #     container_name: ffy_api
+    #     restart: always
+    #     environment:
+    #         - OPENAI_API_KEY=${OPENAI_API_KEY}
+    #         - DATABASE_URL=postgresql://ffy_user:123456@db:5432/ffy_db
+    #         - REDIS_URL=redis://redis:6379
+    #     ports:
+    #         - "8000:8000"
+    #     depends_on:
+    #         - db
+    #         - redis
+    #     networks:
+    #         - ffy-network
 
 volumes:
     pgdata:
+        driver: local
+    redis_data:
         driver: local
 
 networks:
